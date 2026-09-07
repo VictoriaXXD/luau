@@ -622,8 +622,8 @@ void luaV_dobitwiseimpl(lua_State* L, StkId ra, const TValue* rb, const TValue* 
         (c = luaV_tonumber(rc, &tempc)) != NULL)
     {
         // same 32-bit unsigned conversion that is used in the VM execution
-        unsigned ub;
-        unsigned uc;
+        uint32_t ub;
+        uint32_t uc;
 
         double nb = nvalue(b);
         double nc = nvalue(c);
@@ -669,7 +669,7 @@ void luaV_dobitwiseimpl(lua_State* L, StkId ra, const TValue* rb, const TValue* 
 
         case TM_BNOT:
         {
-            uint32_t result = ~uint32_t(ub);
+            uint32_t result = uint32_t(~uint32_t(ub));
             setnvalue(ra, double(result));
             break;
         }

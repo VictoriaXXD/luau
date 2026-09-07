@@ -320,8 +320,14 @@ private:
         unsigned char left, right;
     };
 
+    struct BinaryConfusableResult
+    {
+        std::optional<AstExprBinary::Op> op;
+        bool handled = false;
+    };
+
     std::optional<AstExprUnary::Op> checkUnaryConfusables();
-    std::optional<AstExprBinary::Op> checkBinaryConfusables(const BinaryOpPriority binaryPriority[], unsigned int limit);
+    BinaryConfusableResult checkBinaryConfusables(const BinaryOpPriority binaryPriority[], unsigned int limit, bool expressionStart);
 
     // subexpr -> (asexp | unop subexpr) { binop subexpr }
     // where `binop' is any binary operator with a priority higher than `limit'
@@ -377,7 +383,7 @@ private:
     Name parseIndexName(const char* context, const Position& previous);
 
     // `<' namelist `>'
-    std::pair<AstArray<AstGenericType*>, AstArray<AstGenericTypePack*>> parseGenericTypeList(
+    LUAU_NOINLINE std::pair<AstArray<AstGenericType*>, AstArray<AstGenericTypePack*>> parseGenericTypeList(
         bool withDefaultValues,
         Position* openPosition = nullptr,
         AstArray<Position>* commaPositions = nullptr,
@@ -388,8 +394,13 @@ private:
     AstArray<AstTypeOrPack> parseTypeParams(
         Position* openingPosition = nullptr,
         TempVector<Position>* commaPositions = nullptr,
-        Position* closingPosition = nullptr
+        Position* closingPosition = nullptr,
+        bool openingAlreadyConsumed = false
     );
+
+    unsigned int pendingGreaterThan = 0;
+    unsigned int pendingLessThan = 0;
+    LUAU_NOINLINE bool Parser::isExplicitTypeInstantiationStart();
 
     std::optional<AstArray<char>> parseCharArray(AstArray<char>* originalString = nullptr);
     AstExpr* parseString();

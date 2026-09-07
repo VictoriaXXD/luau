@@ -3398,13 +3398,13 @@ AstTypeOrPack Parser::parseSimpleType(bool allowPack, bool inDeclarationContext)
         TempVector<Position> parametersCommaPositions(scratchPosition);
         Position parametersClosingPosition = Position::missing();
 
-        if (lexer.current().type == '<')
+        if (lexer.current().type == '<' || lexer.current().type == Lexeme::ShiftLeft)
         {
             hasParameters = true;
-            if (options.storeCstData)
-                parameters = parseTypeParams(&parametersOpeningPosition, &parametersCommaPositions, &parametersClosingPosition);
-            else
-                parameters = parseTypeParams();
+        if (options.storeCstData)
+            parameters = parseTypeParams(&parametersOpeningPosition, &parametersCommaPositions, &parametersClosingPosition);
+        else
+            parameters = parseTypeParams();
         }
 
         Location end = lexer.previousLocation();
@@ -3422,7 +3422,7 @@ AstTypeOrPack Parser::parseSimpleType(bool allowPack, bool inDeclarationContext)
     {
         return {parseTableType(/* inDeclarationContext */ inDeclarationContext), {}};
     }
-    else if (lexer.current().type == '(' || lexer.current().type == '<')
+    else if (lexer.current().type == '(' || lexer.current().type == '<' || pendingLessThan > 0)
     {
         return parseFunctionType(allowPack, AstArray<AstAttr*>({nullptr, 0}));
     }
@@ -3607,39 +3607,89 @@ std::optional<AstExprUnary::Op> Parser::checkUnaryConfusables()
     return {};
 }
 
-std::optional<AstExprBinary::Op> Parser::checkBinaryConfusables(const BinaryOpPriority binaryPriority[], unsigned int limit)
+LUAU_NOINLINE Parser::BinaryConfusableResult Parser::checkBinaryConfusables(const BinaryOpPriority binaryPriority[], unsigned int limit, bool expressionStart)
 {
     const Lexeme& curr = lexer.current();
 
-    // early-out: need to check if this is a possible confusable quickly
+    // Fast path: not a possible confusable.
     if (curr.type != '&' && curr.type != '|' && curr.type != '!')
         return {};
 
-    // slow path: possible confusable
     Location start = curr.location;
     Lexeme next = lexer.lookahead();
 
-    if (curr.type == '&' && next.type == '&' && curr.location.end == next.location.begin && binaryPriority[AstExprBinary::And].left > limit)
+    // Confusable operators must be adjacent.
+    if (curr.location.end != next.location.begin)
+        return {};
+
+    if (curr.type == '&' && next.type == '&')
     {
-        nextLexeme();
-        report(Location(start, next.location), "Unexpected '&&'; did you mean 'and'?");
-        return AstExprBinary::And;
+        if (expressionStart)
+        {
+            Location errorLocation(start.begin, next.location.end);
+
+            nextLexeme();
+            nextLexeme();
+
+            report(errorLocation, "Unexpected '&&'; did you mean 'and'?");
+
+            return {std::nullopt, true};
+        }
+
+        if (binaryPriority[AstExprBinary::And].left > limit)
+        {
+            nextLexeme();
+
+            report(
+                Location(start.begin, next.location.end),
+                "Unexpected '&&'; did you mean 'and'?"
+            );
+
+            return {AstExprBinary::And, false};
+        }
     }
-    else if (curr.type == '|' && next.type == '|' && curr.location.end == next.location.begin && binaryPriority[AstExprBinary::Or].left > limit)
+    else if (curr.type == '|' && next.type == '|')
     {
-        nextLexeme();
-        report(Location(start, next.location), "Unexpected '||'; did you mean 'or'?");
-        return AstExprBinary::Or;
+        if (expressionStart)
+        {
+            Location errorLocation(start.begin, next.location.end);
+
+            nextLexeme();
+            nextLexeme();
+
+            report(errorLocation, "Unexpected '||'; did you mean 'or'?");
+
+            return {std::nullopt, true};
+        }
+
+        if (binaryPriority[AstExprBinary::Or].left > limit)
+        {
+            nextLexeme();
+
+            report(
+                Location(start.begin, next.location.end),
+                "Unexpected '||'; did you mean 'or'?"
+            );
+
+            return {AstExprBinary::Or, false};
+        }
     }
-    else if (curr.type == '!' && next.type == '=' && curr.location.end == next.location.begin &&
-             binaryPriority[AstExprBinary::CompareNe].left > limit)
+    else if (curr.type == '!' && next.type == '=')
     {
-        nextLexeme();
-        report(Location(start, next.location), "Unexpected '!='; did you mean '~='?");
-        return AstExprBinary::CompareNe;
+        if (binaryPriority[AstExprBinary::CompareNe].left > limit)
+        {
+            nextLexeme();
+
+            report(
+                Location(start.begin, next.location.end),
+                "Unexpected '!='; did you mean '~='?"
+            );
+
+            return {AstExprBinary::CompareNe, false};
+        }
     }
 
-    return std::nullopt;
+    return {};
 }
 
 // subexpr -> (asexp | unop subexpr) { binop subexpr }
@@ -3701,14 +3751,26 @@ AstExpr* Parser::parseExpr(unsigned int limit)
     }
     else
     {
-        expr = parseAssertionExpr();
+        BinaryConfusableResult confusable =
+            checkBinaryConfusables(binaryPriority, limit, true);
+
+        if (confusable.handled)
+        {
+            expr = allocator.alloc<AstExprError>(
+                lexer.previousLocation(),
+                copy<AstExpr*>({}),
+                unsigned(parseErrors.size() - 1)
+            );
+        }
+        else
+        {
+            expr = parseAssertionExpr();
+        }
     }
 
     // expand while operators have priorities higher than `limit'
-    std::optional<AstExprBinary::Op> op = parseBinaryOp(lexer.current());
-
-    if (!op)
-        op = checkBinaryConfusables(binaryPriority, limit);
+    BinaryConfusableResult confusable = checkBinaryConfusables(binaryPriority, limit, false);
+    std::optional<AstExprBinary::Op> op = confusable.op ? confusable.op : parseBinaryOp(lexer.current());
 
     while (op && binaryPriority[*op].left > limit)
     {
@@ -3721,10 +3783,9 @@ AstExpr* Parser::parseExpr(unsigned int limit)
         expr = allocator.alloc<AstExprBinary>(Location(start, next->location), *op, expr, next);
         if (options.storeCstData)
             cstNodeMap[expr] = allocator.alloc<CstExprOp>(opPosition);
-        op = parseBinaryOp(lexer.current());
 
-        if (!op)
-            op = checkBinaryConfusables(binaryPriority, limit);
+        confusable = checkBinaryConfusables(binaryPriority, limit, false);
+        op = confusable.op ? confusable.op : parseBinaryOp(lexer.current());
 
         // note: while the parser isn't recursive here, we're generating recursive structures of unbounded depth
         incrementRecursionCounter("expression");
@@ -3845,7 +3906,7 @@ AstExpr* Parser::parsePrimaryExpr(bool asStatement)
         {
             expr = parseFunctionArgs(expr, false);
         }
-        else if (lexer.current().type == '<' && lexer.lookahead().type == '<')
+        else if (isExplicitTypeInstantiationStart())
         {
             expr = parseExplicitTypeInstantiationExpr(start, *expr);
         }
@@ -3893,7 +3954,7 @@ AstExpr* Parser::parseMethodCall(Position start, AstExpr* expr)
     AstArray<AstTypeOrPack> typeArguments;
     CstTypeInstantiation* cstTypeArguments = options.storeCstData ? allocator.alloc<CstTypeInstantiation>() : nullptr;
 
-    if (lexer.current().type == '<' && lexer.lookahead().type == '<')
+    if (isExplicitTypeInstantiationStart())
     {
         typeArguments = parseTypeInstantiationExpr(cstTypeArguments);
     }
@@ -4530,11 +4591,20 @@ std::pair<AstArray<AstGenericType*>, AstArray<AstGenericTypePack*>> Parser::pars
     TempVector<AstGenericTypePack*> namePacks{scratchGenericTypePacks};
     TempVector<Position> localCommaPositions{scratchPosition};
 
-    if (lexer.current().type == '<')
+    if (pendingLessThan > 0 || lexer.current().type == '<' || lexer.current().type == Lexeme::ShiftLeft)
     {
         Lexeme begin = lexer.current();
         if (openPosition)
             *openPosition = begin.location.begin;
+
+        if (pendingLessThan > 0)
+            pendingLessThan--;
+        else if (lexer.current().type == Lexeme::ShiftLeft)
+        {
+            pendingLessThan++;
+            nextLexeme();
+        }
+    else
         nextLexeme();
 
         bool seenPack = false;
@@ -4652,16 +4722,35 @@ std::pair<AstArray<AstGenericType*>, AstArray<AstGenericTypePack*>> Parser::pars
     return {generics, genericPacks};
 }
 
-AstArray<AstTypeOrPack> Parser::parseTypeParams(Position* openingPosition, TempVector<Position>* commaPositions, Position* closingPosition)
+AstArray<AstTypeOrPack> Parser::parseTypeParams(Position* openingPosition, TempVector<Position>* commaPositions, Position* closingPosition, bool openingAlreadyConsumed)
 {
     TempVector<AstTypeOrPack> parameters{scratchTypeOrPack};
 
-    if (lexer.current().type == '<')
+    if (openingAlreadyConsumed || pendingLessThan > 0 || lexer.current().type == '<' || lexer.current().type == Lexeme::ShiftLeft)
     {
         Lexeme begin = lexer.current();
-        if (openingPosition)
-            *openingPosition = begin.location.begin;
-        nextLexeme();
+
+        if (!openingAlreadyConsumed)
+        {
+            if (pendingLessThan > 0)
+            {
+            // an outer '<<' already consumed both '<' characters; this call claims the second one
+                pendingLessThan--;
+            }
+            else if (lexer.current().type == Lexeme::ShiftLeft)
+            {
+                if (openingPosition)
+                    *openingPosition = begin.location.begin;
+                pendingLessThan++;
+                nextLexeme();
+            }
+            else
+            {
+                if (openingPosition)
+                    *openingPosition = begin.location.begin;
+                nextLexeme();
+            }
+        }
 
         while (true)
         {
@@ -4749,12 +4838,23 @@ AstArray<AstTypeOrPack> Parser::parseTypeParams(Position* openingPosition, TempV
             {
                 break;
             }
+            else if (lexer.current().type == Lexeme::ShiftRight && parameters.empty())
+            {
+                break;
+            }
+            else if (pendingLessThan > 0)
+            {
+                // a nested '<<' already opened this parameter's own explicit generic list
+                // (e.g. `func<<T>(T) -> number>`) — hand off to parseFunctionType so its call
+                // to parseGenericTypeList can claim the pending '<', instead of parsing a bare name
+                parameters.push_back(parseFunctionType(/* allowPack */ true, AstArray<AstAttr*>({nullptr, 0})));
+            }
             else
             {
                 parameters.push_back({parseType(), {}});
             }
 
-            if (lexer.current().type == ',')
+            if (lexer.current().type == ',' && pendingGreaterThan == 0)
             {
                 if (commaPositions)
                     commaPositions->push_back(lexer.current().location.begin);
@@ -4764,7 +4864,29 @@ AstArray<AstTypeOrPack> Parser::parseTypeParams(Position* openingPosition, TempV
                 break;
         }
 
-        bool closingBracketFound = expectMatchAndConsume('>', begin);
+        bool closingBracketFound = false;
+
+        if (pendingGreaterThan > 0)
+        {
+            pendingGreaterThan--;
+            closingBracketFound = true;
+        }
+        else if (lexer.current().type == '>')
+        {
+            closingBracketFound = true;
+            nextLexeme();
+        }
+        else if (lexer.current().type == Lexeme::ShiftRight)
+        {
+            closingBracketFound = true;
+
+            if (!openingAlreadyConsumed)
+            {
+                pendingGreaterThan++;
+                nextLexeme();
+            }
+        }
+
         if (closingPosition && closingBracketFound)
             *closingPosition = lexer.previousLocation().begin;
     }
@@ -5004,40 +5126,64 @@ AstExpr* Parser::parseClassRefExpr()
 
 AstArray<AstTypeOrPack> Parser::parseTypeInstantiationExpr(CstTypeInstantiation* cstNodeOut, Location* endLocationOut)
 {
-    LUAU_ASSERT(lexer.current().type == '<' && lexer.lookahead().type == '<');
-
-    if (cstNodeOut)
-    {
-        cstNodeOut->leftArrow1Position = lexer.current().location.begin;
-    }
+    LUAU_ASSERT(lexer.current().type == Lexeme::ShiftLeft || lexer.current().type == '<');
 
     Lexeme begin = lexer.current();
-    lexer.next();
+
+    if (lexer.current().type == Lexeme::ShiftLeft)
+    {
+        if (cstNodeOut)
+        {
+            cstNodeOut->leftArrow1Position = begin.location.begin;
+            cstNodeOut->leftArrow2Position = Position{begin.location.begin.line, begin.location.begin.column + 1};
+        }
+        lexer.next();
+    }
+    else
+    {
+        // two separate '<' lexemes (e.g. written with a space between them)
+        if (cstNodeOut)
+            cstNodeOut->leftArrow1Position = begin.location.begin;
+        nextLexeme(); // consume first '<'
+
+        LUAU_ASSERT(lexer.current().type == '<');
+        if (cstNodeOut)
+            cstNodeOut->leftArrow2Position = lexer.current().location.begin;
+        nextLexeme(); // consume second '<'
+    }
 
     TempVector<Position> commaPositions = TempVector{scratchPosition};
 
     AstArray<AstTypeOrPack> typeOrPacks = parseTypeParams(
-        cstNodeOut ? &cstNodeOut->leftArrow2Position : nullptr,
+        nullptr,
         cstNodeOut ? &commaPositions : nullptr,
-        cstNodeOut ? &cstNodeOut->rightArrow1Position : nullptr
+        cstNodeOut ? &cstNodeOut->rightArrow1Position : nullptr,
+        true
     );
 
     if (cstNodeOut)
     {
         cstNodeOut->commaPositions = copy(commaPositions);
 
-        if (lexer.current().type == '>')
-        {
+        if (lexer.current().type == '>' || lexer.current().type == Lexeme::ShiftRight)
             cstNodeOut->rightArrow2Position = lexer.current().location.begin;
-        }
     }
 
-    if (endLocationOut)
+    if (lexer.current().type == Lexeme::ShiftRight)
     {
-        *endLocationOut = lexer.current().location;
+        if (endLocationOut)
+            *endLocationOut = lexer.current().location;
+
+        lexer.next();
+    }
+    else
+    {
+        expectMatchAndConsume('>', begin);
+
+        if (endLocationOut)
+            *endLocationOut = lexer.previousLocation();
     }
 
-    expectMatchAndConsume('>', begin);
     return typeOrPacks;
 }
 
@@ -5140,6 +5286,13 @@ bool Parser::expectAndConsume(Lexeme::Type type, const char* context)
 
     nextLexeme();
     return true;
+}
+
+// small, keep out of the hot recursive parsePrimaryExpr frame
+LUAU_NOINLINE bool Parser::isExplicitTypeInstantiationStart()
+{
+    return lexer.current().type == Lexeme::ShiftLeft ||
+           (lexer.current().type == '<' && lexer.lookahead().type == '<');
 }
 
 // LUAU_NOINLINE is used to limit the stack cost due to std::string objects, and to increase caller performance since this code is cold
