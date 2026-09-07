@@ -15,7 +15,7 @@ on:
       - 'papers/**'
       - 'rfcs/**'
       - '*.md'
-
+  workflow_dispatch:
 jobs:
   unix:
     strategy:
